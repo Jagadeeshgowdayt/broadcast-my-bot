@@ -1,7 +1,7 @@
 import logging
 import json
 from pathlib import Path
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, ContextTypes, ChatMemberHandler
 from telegram.error import TelegramError
 
@@ -26,16 +26,13 @@ def load_channels() -> set:
     """Loads the set of channel IDs from the JSON file."""
     try:
         with open(CHANNELS_FILE, "r") as f:
-            # Load the list and convert it to a set for efficient adds/removes
             return set(json.load(f))
     except (FileNotFoundError, json.JSONDecodeError):
-        # If the file doesn't exist or is empty/corrupt, start with an empty set
         return set()
 
 def save_channels(channel_ids: set) -> None:
     """Saves the set of channel IDs to the JSON file."""
     with open(CHANNELS_FILE, "w") as f:
-        # Convert the set to a list to make it JSON serializable
         json.dump(list(channel_ids), f, indent=4)
 
 # --- BOT LOGIC ---
@@ -46,20 +43,22 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Sends a welcome message."""
+    """Sends a welcome message explaining the new features."""
     await update.message.reply_html(
-        "👋 <b>Welcome to the Smart Broadcast Bot!</b>\n\n"
-        "I automatically learn which channels to broadcast to when you add me as an admin.\n\n"
-        "<b>Authorized Command:</b> /broadcast <i>your message</i>"
+        "👋 <b>Welcome to the Advanced Broadcast Bot!</b>\n\n"
+        "I can now send complex posts to all your channels.\n\n"
+        "<b>Two Ways to Broadcast:</b>\n\n"
+        "1️⃣ <b>Copy Existing Message:</b>\n"
+        "Simply reply to <i>any</i> message (text, photo, poll, etc.) with the command <code>/broadcast</code>. I will send an exact copy of that message to all channels.\n\n"
+        "2️⃣ <b>Create a New Post with Buttons:</b>\n"
+        "Use this format to create a message with inline URL buttons:\n"
+        "<code>/broadcast Your message text here. || Button 1 Text | https://link1.com || Button 2 Text | https://link2.com</code>\n\n"
+        "Use <code>||</code> to separate the message from the buttons, and to separate each button. Use <code>|</code> to separate a button's text from its URL."
     )
 
 async def update_channel_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Handles the bot being added to or removed from a channel.
-    This is how the bot "learns" where it can post.
-    """
+    """Handles the bot being added to or removed from a channel."""
     chat_member_update = update.my_chat_member
-    
     if chat_member_update.chat.type != 'channel':
         return
 
@@ -72,7 +71,6 @@ async def update_channel_list(update: Update, context: ContextTypes.DEFAULT_TYPE
             logger.info(f"Bot was added to new channel: {chat_id}. Adding to list.")
             current_channels.add(chat_id)
             save_channels(current_channels)
-            
     elif new_status in ['left', 'kicked']:
         if chat_id in current_channels:
             logger.info(f"Bot was removed from channel: {chat_id}. Removing from list.")
@@ -80,53 +78,85 @@ async def update_channel_list(update: Update, context: ContextTypes.DEFAULT_TYPE
             save_channels(current_channels)
 
 async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Broadcasts a message to all learned channels."""
+    """Broadcasts a message by copying or creating a new one with buttons."""
     user_id = update.message.from_user.id
-
-    # --- NEW: Check if the user is in the authorized list ---
     if user_id not in AUTHORIZED_USERS:
         await update.message.reply_text("Sorry, you are not authorized to use this command.")
-        logger.warning(f"Unauthorized broadcast attempt by user ID: {user_id}")
         return
 
-    message_to_broadcast = " ".join(context.args)
-    if not message_to_broadcast:
-        await update.message.reply_text("Please provide a message. Ex: /broadcast Hello channels!")
-        return
-
-    logger.info(f"Broadcast initiated by authorized user {user_id}. Message: '{message_to_broadcast}'")
-    
     channels_to_broadcast = load_channels()
-
     if not channels_to_broadcast:
         await update.message.reply_text("I don't know about any channels yet. Add me to a channel as an admin first.")
         return
 
     successful_sends = 0
     failed_sends = 0
+    
+    # --- METHOD 1: Reply to a message to copy it ---
+    if update.message.reply_to_message:
+        logger.info(f"Broadcast initiated by {user_id} by replying to a message.")
+        message_to_copy = update.message.reply_to_message
+        for channel_id in channels_to_broadcast:
+            try:
+                await context.bot.copy_message(
+                    chat_id=channel_id,
+                    from_chat_id=message_to_copy.chat_id,
+                    message_id=message_to_copy.message_id
+                )
+                successful_sends += 1
+            except TelegramError as e:
+                logger.error(f"Failed to copy message to channel {channel_id}: {e}")
+                failed_sends += 1
+    
+    # --- METHOD 2: Create a new message from command arguments ---
+    else:
+        full_command_text = " ".join(context.args)
+        if not full_command_text:
+            await update.message.reply_text("Please provide a message or reply to one.\nSee /start for instructions.")
+            return
 
-    for channel_id in channels_to_broadcast:
-        try:
-            await context.bot.send_message(
-                chat_id=channel_id, text=message_to_broadcast, parse_mode='HTML'
-            )
-            logger.info(f"Successfully sent message to channel {channel_id}")
-            successful_sends += 1
-        except TelegramError as e:
-            logger.error(f"Failed to send to channel {channel_id}: {e}. It might be removed.")
-            failed_sends += 1
-            
-    await update.message.reply_text(
+        logger.info(f"Broadcast initiated by {user_id} with new message.")
+        
+        parts = full_command_text.split('||')
+        message_text = parts[0].strip()
+        button_definitions = parts[1:]
+        
+        keyboard = []
+        for definition in button_definitions:
+            try:
+                btn_text, btn_url = [item.strip() for item in definition.split('|', 1)]
+                if btn_text and btn_url:
+                    keyboard.append([InlineKeyboardButton(text=btn_text, url=btn_url)])
+            except ValueError:
+                logger.warning(f"Could not parse button definition: '{definition}'")
+        
+        reply_markup = InlineKeyboardMarkup(keyboard) if keyboard else None
+
+        for channel_id in channels_to_broadcast:
+            try:
+                await context.bot.send_message(
+                    chat_id=channel_id,
+                    text=message_text,
+                    parse_mode='HTML',
+                    reply_markup=reply_markup,
+                    disable_web_page_preview=True
+                )
+                successful_sends += 1
+            except TelegramError as e:
+                logger.error(f"Failed to send message to channel {channel_id}: {e}")
+                failed_sends += 1
+
+    # --- Send final report ---
+    await update.message.reply_html(
         f"📢 <b>Broadcast Complete!</b>\n\n"
         f"✅ Sent to <b>{successful_sends}</b> channel(s).\n"
-        f"❌ Failed for <b>{failed_sends}</b> channel(s).",
-        parse_mode='HTML'
+        f"❌ Failed for <b>{failed_sends}</b> channel(s)."
     )
 
 def main() -> None:
     """Start the bot."""
     if not AUTHORIZED_USERS or 0 in AUTHORIZED_USERS:
-        logger.error("FATAL: AUTHORIZED_USERS list is not set up correctly. Please edit the script and add at least one real Telegram User ID.")
+        logger.error("FATAL: AUTHORIZED_USERS list is not set up correctly. Please edit it.")
         return
         
     application = Application.builder().token(BOT_TOKEN).build()
@@ -135,7 +165,7 @@ def main() -> None:
     application.add_handler(CommandHandler("broadcast", broadcast))
     application.add_handler(ChatMemberHandler(update_channel_list, ChatMemberHandler.MY_CHAT_MEMBER))
 
-    logger.info("Smart Bot is starting...")
+    logger.info("Advanced Bot is starting...")
     application.run_polling()
 
 if __name__ == "__main__":
