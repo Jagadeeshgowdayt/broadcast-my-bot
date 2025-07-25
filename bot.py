@@ -19,6 +19,7 @@ AUTHORIZED_USERS = [
 
 # The file where the bot will store the channel IDs it learns.
 CHANNELS_FILE = "broadcast_channels.json"
+MIN_LOOP_INTERVAL = 30 # Minimum number of seconds between loop broadcasts
 # --- END CONFIGURATION ---
 
 # --- DATA PERSISTENCE ---
@@ -43,17 +44,21 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Sends a welcome message explaining the new features."""
+    """Sends a welcome message explaining all features."""
     await update.message.reply_html(
         "👋 <b>Welcome to the Advanced Broadcast Bot!</b>\n\n"
-        "I can now send complex posts to all your channels.\n\n"
-        "<b>Two Ways to Broadcast:</b>\n\n"
+        "I can send single or recurring posts to all your channels.\n\n"
+        "<b>--- One-Time Broadcast ---</b>\n"
         "1️⃣ <b>Copy Existing Message:</b>\n"
-        "Simply reply to <i>any</i> message (text, photo, poll, etc.) with the command <code>/broadcast</code>. I will send an exact copy of that message to all channels.\n\n"
-        "2️⃣ <b>Create a New Post with Buttons:</b>\n"
-        "Use this format to create a message with inline URL buttons:\n"
-        "<code>/broadcast Your message text here. || Button 1 Text | https://link1.com || Button 2 Text | https://link2.com</code>\n\n"
-        "Use <code>||</code> to separate the message from the buttons, and to separate each button. Use <code>|</code> to separate a button's text from its URL."
+        "Reply to <i>any</i> message with <code>/broadcast</code> to send a copy.\n\n"
+        "2️⃣ <b>Create New Post w/ Buttons:</b>\n"
+        "<code>/broadcast Your text || Btn1 | link1.com</code>\n\n"
+        "<b>--- Recurring Broadcast ---</b>\n"
+        "1️⃣ <b>Start a Loop:</b>\n"
+        "Reply to a message with <code>/loop_broadcast &lt;seconds&gt;</code>.\n"
+        "Example: <code>/loop_broadcast 3600</code> (sends every hour).\n\n"
+        "2️⃣ <b>Stop a Loop:</b>\n"
+        "Use the command <code>/stop_loop</code>."
     )
 
 async def update_channel_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -78,7 +83,7 @@ async def update_channel_list(update: Update, context: ContextTypes.DEFAULT_TYPE
             save_channels(current_channels)
 
 async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Broadcasts a message by copying or creating a new one with buttons."""
+    """Broadcasts a single message by copying or creating a new one."""
     user_id = update.message.from_user.id
     if user_id not in AUTHORIZED_USERS:
         await update.message.reply_text("Sorry, you are not authorized to use this command.")
@@ -86,13 +91,11 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     channels_to_broadcast = load_channels()
     if not channels_to_broadcast:
-        await update.message.reply_text("I don't know about any channels yet. Add me to a channel as an admin first.")
+        await update.message.reply_text("I don't know about any channels yet. Add me as an admin first.")
         return
 
-    successful_sends = 0
-    failed_sends = 0
+    successful_sends, failed_sends = 0, 0
     
-    # --- METHOD 1: Reply to a message to copy it ---
     if update.message.reply_to_message:
         logger.info(f"Broadcast initiated by {user_id} by replying to a message.")
         message_to_copy = update.message.reply_to_message
@@ -107,8 +110,6 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             except TelegramError as e:
                 logger.error(f"Failed to copy message to channel {channel_id}: {e}")
                 failed_sends += 1
-    
-    # --- METHOD 2: Create a new message from command arguments ---
     else:
         full_command_text = " ".join(context.args)
         if not full_command_text:
@@ -116,11 +117,9 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             return
 
         logger.info(f"Broadcast initiated by {user_id} with new message.")
-        
         parts = full_command_text.split('||')
         message_text = parts[0].strip()
         button_definitions = parts[1:]
-        
         keyboard = []
         for definition in button_definitions:
             try:
@@ -131,27 +130,90 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 logger.warning(f"Could not parse button definition: '{definition}'")
         
         reply_markup = InlineKeyboardMarkup(keyboard) if keyboard else None
-
         for channel_id in channels_to_broadcast:
             try:
                 await context.bot.send_message(
-                    chat_id=channel_id,
-                    text=message_text,
-                    parse_mode='HTML',
-                    reply_markup=reply_markup,
-                    disable_web_page_preview=True
+                    chat_id=channel_id, text=message_text, parse_mode='HTML',
+                    reply_markup=reply_markup, disable_web_page_preview=True
                 )
                 successful_sends += 1
             except TelegramError as e:
                 logger.error(f"Failed to send message to channel {channel_id}: {e}")
                 failed_sends += 1
 
-    # --- Send final report ---
     await update.message.reply_html(
-        f"📢 <b>Broadcast Complete!</b>\n\n"
+        f"📢 <b>One-Time Broadcast Complete!</b>\n\n"
         f"✅ Sent to <b>{successful_sends}</b> channel(s).\n"
         f"❌ Failed for <b>{failed_sends}</b> channel(s)."
     )
+
+async def recurring_broadcast_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """The job function that sends the message on a schedule."""
+    job_data = context.job.data
+    from_chat_id = job_data['from_chat_id']
+    message_id = job_data['message_id']
+    
+    channels_to_broadcast = load_channels()
+    logger.info(f"Executing recurring broadcast to {len(channels_to_broadcast)} channels.")
+    
+    for channel_id in channels_to_broadcast:
+        try:
+            await context.bot.copy_message(
+                chat_id=channel_id,
+                from_chat_id=from_chat_id,
+                message_id=message_id
+            )
+        except TelegramError as e:
+            logger.error(f"Failed to send recurring message to channel {channel_id}: {e}")
+
+async def loop_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Starts a recurring broadcast."""
+    user_id = update.message.from_user.id
+    if user_id not in AUTHORIZED_USERS:
+        await update.message.reply_text("Sorry, you are not authorized to use this command.")
+        return
+
+    if 'active_loop_job' in context.bot_data:
+        await update.message.reply_text("A broadcast loop is already running. Use /stop_loop first.")
+        return
+
+    if not update.message.reply_to_message:
+        await update.message.reply_text("Please reply to the message you want to loop-broadcast.")
+        return
+
+    try:
+        interval = int(context.args[0])
+        if interval < MIN_LOOP_INTERVAL:
+            await update.message.reply_text(f"The interval must be at least {MIN_LOOP_INTERVAL} seconds.")
+            return
+    except (IndexError, ValueError):
+        await update.message.reply_text("Please provide a valid interval in seconds.\nExample: /loop_broadcast 3600")
+        return
+
+    message_to_loop = update.message.reply_to_message
+    job_data = {
+        'from_chat_id': message_to_loop.chat_id,
+        'message_id': message_to_loop.message_id
+    }
+    
+    job = context.job_queue.run_repeating(recurring_broadcast_job, interval=interval, data=job_data)
+    context.bot_data['active_loop_job'] = job
+    
+    await update.message.reply_html(f"✅ <b>Recurring broadcast started!</b>\nI will send this message every <b>{interval}</b> seconds. Use /stop_loop to cancel.")
+
+async def stop_loop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Stops the recurring broadcast."""
+    user_id = update.message.from_user.id
+    if user_id not in AUTHORIZED_USERS:
+        await update.message.reply_text("Sorry, you are not authorized to use this command.")
+        return
+
+    job = context.bot_data.pop('active_loop_job', None)
+    if job:
+        job.schedule_removal()
+        await update.message.reply_text("✅ Recurring broadcast has been stopped.")
+    else:
+        await update.message.reply_text("There is no active recurring broadcast to stop.")
 
 def main() -> None:
     """Start the bot."""
@@ -161,8 +223,11 @@ def main() -> None:
         
     application = Application.builder().token(BOT_TOKEN).build()
 
+    # Add all command handlers
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("broadcast", broadcast))
+    application.add_handler(CommandHandler("loop_broadcast", loop_broadcast))
+    application.add_handler(CommandHandler("stop_loop", stop_loop))
     application.add_handler(ChatMemberHandler(update_channel_list, ChatMemberHandler.MY_CHAT_MEMBER))
 
     logger.info("Advanced Bot is starting...")
